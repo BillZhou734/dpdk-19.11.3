@@ -81,6 +81,7 @@ void mlx5_mr_release(struct mlx5_ibv_shared *sh);
 /* Debug purpose functions. */
 void mlx5_mr_btree_dump(struct mlx5_mr_btree *bt);
 void mlx5_mr_dump_dev(struct mlx5_ibv_shared *sh);
+void mlx5_mr_regist_other_socket(struct rte_eth_dev *dev);
 
 /**
  * Look up LKey from given lookup table by linear search. Firstly look up the

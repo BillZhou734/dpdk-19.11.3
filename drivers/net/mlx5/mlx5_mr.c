@@ -29,6 +29,13 @@ struct mr_find_contig_memsegs_data {
 	const struct rte_memseg_list *msl;
 };
 
+#define MAX_CONINU_MSG 32
+struct mr_find_contig_memsegs {
+	int32_t socket_id;
+	uint32_t count;
+	struct mr_find_contig_memsegs_data data[MAX_CONINU_MSG];
+};
+
 struct mr_update_mp_data {
 	struct rte_eth_dev *dev;
 	struct mlx5_mr_ctrl *mr_ctrl;
@@ -240,7 +247,6 @@ mlx5_mr_btree_free(struct mlx5_mr_btree *bt)
 void
 mlx5_mr_btree_dump(struct mlx5_mr_btree *bt __rte_unused)
 {
-#ifndef NDEBUG
 	int idx;
 	struct mlx5_mr_cache *lkp_tbl;
 
@@ -250,11 +256,10 @@ mlx5_mr_btree_dump(struct mlx5_mr_btree *bt __rte_unused)
 	for (idx = 0; idx < bt->len; ++idx) {
 		struct mlx5_mr_cache *entry = &lkp_tbl[idx];
 
-		DEBUG("B-tree(%p)[%u],"
+		DRV_LOG(DEBUG, "B-tree(%p)[%u],"
 		      " [0x%" PRIxPTR ", 0x%" PRIxPTR ") lkey=0x%x",
 		      (void *)bt, idx, entry->start, entry->end, entry->lkey);
 	}
-#endif
 }
 
 /**
@@ -597,6 +602,7 @@ mlx5_mr_create_primary(struct rte_eth_dev *dev, struct mlx5_mr_cache *entry,
 
 	DRV_LOG(DEBUG, "port %u creating a MR using address (%p)",
 		dev->data->port_id, (void *)addr);
+	mlx5_mr_dump_dev(priv->sh);
 	/*
 	 * Release detached MRs if any. This can't be called with holding either
 	 * memory_hotplug_lock or sh->mr.rwlock. MRs on the free list have
@@ -1551,7 +1557,6 @@ mlx5_mr_update_mp(struct rte_eth_dev *dev, struct mlx5_mr_ctrl *mr_ctrl,
 void
 mlx5_mr_dump_dev(struct mlx5_ibv_shared *sh __rte_unused)
 {
-#ifndef NDEBUG
 	struct mlx5_mr *mr;
 	int mr_n = 0;
 	int chunk_n = 0;
@@ -1561,7 +1566,7 @@ mlx5_mr_dump_dev(struct mlx5_ibv_shared *sh __rte_unused)
 	LIST_FOREACH(mr, &sh->mr.mr_list, mr) {
 		unsigned int n;
 
-		DEBUG("device %s MR[%u], LKey = 0x%x, ms_n = %u, ms_bmp_n = %u",
+		DRV_LOG(DEBUG, "device %s MR[%u], LKey = 0x%x, ms_n = %u, ms_bmp_n = %u",
 		      sh->ibdev_name, mr_n++,
 		      rte_cpu_to_be_32(mr->ibv_mr->lkey),
 		      mr->ms_n, mr->ms_bmp_n);
@@ -1573,14 +1578,13 @@ mlx5_mr_dump_dev(struct mlx5_ibv_shared *sh __rte_unused)
 			n = mr_find_next_chunk(mr, &ret, n);
 			if (!ret.end)
 				break;
-			DEBUG("  chunk[%u], [0x%" PRIxPTR ", 0x%" PRIxPTR ")",
+			DRV_LOG(DEBUG, "  chunk[%u], [0x%" PRIxPTR ", 0x%" PRIxPTR ")",
 			      chunk_n++, ret.start, ret.end);
 		}
 	}
-	DEBUG("device %s dumping global cache", sh->ibdev_name);
+	DRV_LOG(DEBUG, "device %s dumping global cache", sh->ibdev_name);
 	mlx5_mr_btree_dump(&sh->mr.cache);
 	rte_rwlock_read_unlock(&sh->mr.rwlock);
-#endif
 }
 
 /**
@@ -1614,3 +1618,86 @@ mlx5_mr_release(struct mlx5_ibv_shared *sh)
 	/* Free all remaining MRs. */
 	mlx5_mr_garbage_collect(sh);
 }
+
+/**
+ * Find all contigus mem segs , store to array.
+ *
+ * @param msl
+ *   Pointer to current memseg list.
+ * @param ms
+ *   Pointer to ms - in the msl.
+ * @param len
+ *   Len of ms to a contigus range.
+ * @param arg
+ *  Pointer to mr_find_contig_memsegs
+ *
+ * @return
+ *   0 on success.
+ */
+static int
+mr_find_contig_memsegs_cb_by_sockid(const struct rte_memseg_list *msl,
+			  const struct rte_memseg *ms, size_t len, void *arg)
+{
+	struct mr_find_contig_memsegs *contig_memsegs = arg;
+	struct mr_find_contig_memsegs_data *data;
+
+	if (ms->socket_id == contig_memsegs->socket_id)
+		return 0;
+	if (contig_memsegs->count >= MAX_CONINU_MSG) {
+		DRV_LOG(INFO, "find contig msg reach MAX count.");
+		return 1;
+	}
+	data = &contig_memsegs->data[contig_memsegs->count++];
+	data->start = ms->addr_64;
+	data->end = ms->addr_64 + len;
+	data->msl = msl;
+	DRV_LOG(INFO, "msg:[0x%" PRIxPTR ", 0x%" PRIxPTR "] len %zuMB",
+		data->start, data->end, len >> 20);
+	return 0;
+}
+
+static uint32_t dump_phymem = 1;
+/**
+ * Find and regist mem segs located in other socket.
+ *
+ * @param dev
+ *   Pointer to Ethernet device.
+ */
+void
+mlx5_mr_regist_other_socket(struct rte_eth_dev *dev)
+{
+	uint32_t i, lkey;
+	struct mlx5_rxq_ctrl *rxq_ctrl;
+	uint16_t port_id = dev->data->port_id;
+	int socket_id = rte_eth_dev_socket_id(port_id);
+	struct mlx5_priv *priv = dev->data->dev_private;
+	struct mr_find_contig_memsegs contig_memsegs;
+
+	if (rte_eth_dev_count_total() == 1)
+		return;
+	DRV_LOG(INFO, "regist other socket,port:%d,local:%d", port_id, socket_id);
+	if (dump_phymem && rte_log_get_level(mlx5_logtype) == RTE_LOG_DEBUG) {
+		rte_dump_physmem_layout(stdout);
+		dump_phymem = 0;
+	}
+	memset(&contig_memsegs, 0x0, sizeof(contig_memsegs));
+	contig_memsegs.socket_id = socket_id;
+	rte_memseg_contig_walk(mr_find_contig_memsegs_cb_by_sockid,
+		&contig_memsegs);
+	rxq_ctrl = mlx5_rxq_get(dev, 0);
+	for (i = 0; i < contig_memsegs.count; i++) {
+		lkey = mlx5_mr_addr2mr_bh(dev, &rxq_ctrl->rxq.mr_ctrl,
+			contig_memsegs.data[i].start);
+		if (lkey == UINT32_MAX) {
+			DRV_LOG(WARNING, "i:%d,port:%d,sockid:%d,msg:[0x%"
+				PRIxPTR ", 0x%" PRIxPTR "]",
+				i, port_id, socket_id,
+				contig_memsegs.data[i].start,
+				contig_memsegs.data[i].end);
+			break;
+		}
+	}
+	mlx5_rxq_release(dev, 0);
+	mlx5_mr_dump_dev(priv->sh);
+}
+

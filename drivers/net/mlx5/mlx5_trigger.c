@@ -328,6 +328,7 @@ mlx5_dev_start(struct rte_eth_dev *dev)
 	/* Enable datapath on secondary process. */
 	mlx5_mp_req_start_rxtx(dev);
 	mlx5_dev_interrupt_handler_install(dev);
+	mlx5_mr_regist_other_socket(dev);
 	return 0;
 error:
 	ret = rte_errno; /* Save rte_errno before cleanup. */
